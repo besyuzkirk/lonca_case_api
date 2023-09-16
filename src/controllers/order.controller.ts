@@ -8,36 +8,34 @@ export const calculateMonthlyRevenuesByVendor = async (req: Request, res: Respon
     try {
         const { vendorId, year } = req.query;
 
-        const startDate = new Date(`${year}-01-01`);
-        const endDate = new Date(`${year}-12-31`);
+        if (!vendorId || !year) {
+            return res.status(400).json({ error: "vendorId ve year must" });
+        }
 
         const parentProducts = await ParentProductModel.find({ vendor: vendorId }).exec();
-
         const parentProductIds = parentProducts.map(product => product._id);
 
-
-        const orders = await OrderModel.find({
-            'cart_item': {
-                $elemMatch: {
-                    'product': { $in: parentProductIds },
-                    'order_status': 'Reviewed'
+        const allSales = await OrderModel.aggregate([
+            {
+                $unwind: "$cart_item"
+            },
+            {
+                $addFields: {
+                    "cart_item.order_payment_at": "$payment_at"
                 }
             },
-            'payment_at': { $gte: startDate, $lte: endDate }
-        }).exec();
-
-        const salesByMonths = Array(12).fill(0);
-
-        for (const order of orders) {
-            for (const cartItem of order.cart_item) {
-                const product = parentProducts.find(product => product._id.equals(cartItem.product && cartItem.product.toString()));
-
-                if (product) {
-                    const month = order.payment_at.getMonth();
-                    salesByMonths[month] += cartItem.quantity;
+            {
+                $replaceRoot: {
+                    newRoot: "$cart_item"
                 }
             }
-        }
+        ])
+
+        const vendorSales = allSales.filter(sale => {
+            return parentProductIds.some(productId => productId.equals(sale.product));
+        });
+
+        const salesByMonths = calculateMonthlySales(vendorSales, year.toString())
 
         res.status(200).json({ salesByMonths });
     } catch (error) {
@@ -50,67 +48,86 @@ export const calculateSalesByVendor = async (req: Request, res: Response, next: 
     try {
         const vendorId = req.params.vendorId;
 
+        // Vendor'a ait parent ürünleri bul
+        const parentProducts = await ParentProductModel.find({ vendor: vendorId }).exec();
+        const parentProductIds = parentProducts.map(product => product._id);
 
-        console.log(vendorId)
-        const vendorSales = await OrderModel.aggregate([
+        // Tüm satışları çek ve cart_item'ları ayır
+        const allSales = await OrderModel.aggregate([
             {
-                $match: {
-                    'cart_item.product': {
-                        $in: await ParentProductModel.find({ vendor: vendorId }).distinct('_id'),
-                    },
-                },
+                $unwind: "$cart_item"
             },
             {
-                $unwind: '$cart_item',
+                $addFields: {
+                    "cart_item.order_payment_at": "$payment_at"
+                }
             },
             {
-                $group: {
-                    _id: '$cart_item.product',
-                    totalSales: {
-                        $sum: '$cart_item.quantity',
-                    },
-                },
-            },
-            {
-                $lookup: {
-                    from: 'parnet_products',
-                    localField: '_id',
-                    foreignField: '_id',
-                    as: 'productInfo',
-                },
-            },
-            {
-                $unwind: '$productInfo',
-            },
-            {
-                $project: {
-                    productName: '$productInfo.name',
-                    totalSales: 1,
-                },
-            },
-
+                $replaceRoot: {
+                    newRoot: "$cart_item"
+                }
+            }
         ]);
 
-        const transformedSales = vendorSales.map((sale) => ({
-            ...transformProductName(sale.productName),
-            totalSales: sale.totalSales,
-        }));
-        res.status(200).json({ "data" : transformedSales });
+        // Vendor'a ait satışları filtrele
+        const vendorSales = allSales.filter(sale => {
+            return parentProductIds.some(productId => productId.equals(sale.product));
+        });
 
+        // Ürünlerin toplam satışını hesapla
+        const productSales = vendorSales.reduce((salesMap, sale) => {
+            if (!salesMap[sale.product]) {
+                salesMap[sale.product] = {
+                    product: sale.product,
+                    totalQuantity: 0,
+                };
+            }
+            salesMap[sale.product].totalQuantity += sale.quantity;
+            return salesMap;
+        }, {});
+
+        // Ürün adlarını al ve sonuçları oluştur
+        const productIds = Object.keys(productSales);
+        const productInfo = await ParentProductModel.find({ _id: { $in: productIds } }).exec();
+
+        const result = productInfo.map(info => {
+            const productSale = productSales[info._id.toString()];
+
+            const productNameParts = info.name.split(" - ");
+            return {
+                productNumber: productNameParts[0],
+                productName: productNameParts[1],
+                productColor: productNameParts[2],
+                totalSales: productSale.totalQuantity,
+            };
+        });
+
+        res.status(200).json({"data" : result});
     } catch (error) {
-        res.status(500).json({ error: 'Hata: Satışlar alınamıyor.' });
+        next(error);
     }
+};
+
+function calculateMonthlySales(sales: any[], year: string): number[] {
+    const monthlySales: number[] = Array(12).fill(0);
+
+    for (const sale of sales) {
+        const orderDate = new Date(sale.order_payment_at);
+        const saleYear = orderDate.getFullYear();
+
+        if (saleYear.toString() === year) {
+            const saleMonth = orderDate.getMonth();
+            monthlySales[saleMonth] += sale.quantity;
+        }
+    }
+
+    return monthlySales;
 }
 
-function transformProductName(productName: string): {
-    productNumber: string;
-    productName: string;
-    productColor: string;
-} {
-    const productNameParts = productName.split(' - ');
-    return {
-        productNumber: productNameParts[0] || '',
-        productName: productNameParts[1] || '',
-        productColor: productNameParts[2] || '',
-    };
-}
+
+
+
+
+
+
+
